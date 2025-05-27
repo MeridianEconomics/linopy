@@ -139,11 +139,12 @@ with contextlib.suppress(ModuleNotFoundError):
 with contextlib.suppress(ModuleNotFoundError):
     import coptpy
 
-    try:
-        coptpy.Envr()
-        available_solvers.append("copt")
-    except coptpy.CoptError:
-        pass
+    # Commented out to avoid locking in COPT license on import
+    # try:
+    #     coptpy.Envr()
+    available_solvers.append("copt")
+    # except coptpy.CoptError:
+    #     pass
 
 quadratic_solvers = [s for s in QUADRATIC_SOLVERS if s in available_solvers]
 logger = logging.getLogger(__name__)
@@ -2261,7 +2262,7 @@ class MindOpt(Solver[None]):
         m.dispose()
         env_.dispose()
 
-        return Result(status, solution, m)
+        return Result(status, solution)
 
 
 class PIPS(Solver[None]):
