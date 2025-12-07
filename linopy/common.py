@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import operator
 import os
-from collections.abc import Generator, Hashable, Iterable, Sequence
+from collections.abc import Callable, Generator, Hashable, Iterable, Sequence
 from functools import partial, reduce, wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Generic, TypeVar, overload
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, overload
 from warnings import warn
 
 import numpy as np
@@ -37,7 +37,7 @@ from linopy.types import CoordsLike, DimsLike
 
 if TYPE_CHECKING:
     from linopy.constraints import Constraint
-    from linopy.expressions import LinearExpression
+    from linopy.expressions import LinearExpression, QuadraticExpression
     from linopy.variables import Variable
 
 
@@ -117,7 +117,7 @@ def get_from_iterable(lst: DimsLike | None, index: int) -> Any | None:
     """
     if lst is None:
         return None
-    if isinstance(lst, (Sequence, Iterable)):
+    if isinstance(lst, Sequence | Iterable):
         lst = list(lst)
     else:
         lst = [lst]
@@ -210,7 +210,7 @@ def numpy_to_dataarray(
         return DataArray(arr.item(), coords=coords, dims=dims, **kwargs)
 
     ndim = max(arr.ndim, 0 if coords is None else len(coords))
-    if isinstance(dims, (Iterable, Sequence)):
+    if isinstance(dims, Iterable | Sequence):
         dims = list(dims)
     elif dims is not None:
         dims = [dims]
@@ -250,11 +250,15 @@ def as_dataarray(
         DataArray:
             The converted DataArray.
     """
-    if isinstance(arr, (pd.Series, pd.DataFrame)):
+    if isinstance(arr, pd.Series | pd.DataFrame):
         arr = pandas_to_dataarray(arr, coords=coords, dims=dims, **kwargs)
     elif isinstance(arr, np.ndarray):
         arr = numpy_to_dataarray(arr, coords=coords, dims=dims, **kwargs)
-    elif isinstance(arr, (np.number, int, float, str, bool, list)):
+    elif isinstance(arr, pl.Series):
+        arr = numpy_to_dataarray(arr.to_numpy(), coords=coords, dims=dims, **kwargs)
+    elif isinstance(arr, np.number):
+        arr = DataArray(float(arr), coords=coords, dims=dims, **kwargs)
+    elif isinstance(arr, int | float | str | bool | list):
         arr = DataArray(arr, coords=coords, dims=dims, **kwargs)
 
     elif not isinstance(arr, DataArray):
@@ -267,6 +271,7 @@ def as_dataarray(
             pd.DataFrame,
             np.ndarray,
             DataArray,
+            pl.Series,
         ]
         supported_types_str = ", ".join([t.__name__ for t in supported_types])
         raise TypeError(
@@ -361,22 +366,35 @@ def to_polars(ds: Dataset, **kwargs: Any) -> pl.DataFrame:
 
 def check_has_nulls_polars(df: pl.DataFrame, name: str = "") -> None:
     """
-    Checks if the given DataFrame contains any null values and raises a ValueError if it does.
+    Checks if the given DataFrame contains any null or NaN values and raises a ValueError if it does.
 
     Args:
     ----
-        df (pl.DataFrame): The DataFrame to check for null values.
+        df (pl.DataFrame): The DataFrame to check for null or NaN values.
         name (str): The name of the data container being checked.
 
     Raises:
     ------
-        ValueError: If the DataFrame contains null values,
-        a ValueError is raised with a message indicating the name of the constraint and the fields containing null values.
+        ValueError: If the DataFrame contains null or NaN values,
+        a ValueError is raised with a message indicating the name of the constraint and the fields containing null/NaN values.
     """
+    # Check for null values in all columns
     has_nulls = df.select(pl.col("*").is_null().any())
     null_columns = [col for col in has_nulls.columns if has_nulls[col][0]]
-    if null_columns:
-        raise ValueError(f"{name} contains nan's in field(s) {null_columns}")
+
+    # Check for NaN values only in numeric columns (avoid enum/categorical columns)
+    numeric_cols = [
+        col for col, dtype in zip(df.columns, df.dtypes) if dtype.is_numeric()
+    ]
+
+    nan_columns = []
+    if numeric_cols:
+        has_nans = df.select(pl.col(numeric_cols).is_nan().any())
+        nan_columns = [col for col in has_nans.columns if has_nans[col][0]]
+
+    invalid_columns = list(set(null_columns + nan_columns))
+    if invalid_columns:
+        raise ValueError(f"{name} contains nan's in field(s) {invalid_columns}")
 
 
 def filter_nulls_polars(df: pl.DataFrame) -> pl.DataFrame:
@@ -493,7 +511,7 @@ def fill_missing_coords(
 
     """
     ds = ds.copy()
-    if not isinstance(ds, (Dataset, DataArray)):
+    if not isinstance(ds, Dataset | DataArray):
         raise TypeError(f"Expected xarray.DataArray or xarray.Dataset, got {type(ds)}.")
 
     skip_dims = [] if fill_helper_dims else HELPER_DIMS
@@ -732,7 +750,118 @@ def get_dims_with_index_levels(
     return dims_with_levels
 
 
-def get_label_position(
+class LabelPositionIndex:
+    """
+    Index for fast O(log n) lookup of label positions using binary search.
+
+    This class builds a sorted index of label ranges and uses binary search
+    to find which container (variable/constraint) a label belongs to.
+
+    Parameters
+    ----------
+    obj : Any
+        Container object with items() method returning (name, val) pairs,
+        where val has .labels and .range attributes.
+    """
+
+    __slots__ = ("_starts", "_names", "_obj", "_built")
+
+    def __init__(self, obj: Any) -> None:
+        self._obj = obj
+        self._starts: np.ndarray | None = None
+        self._names: list[str] | None = None
+        self._built = False
+
+    def _build_index(self) -> None:
+        """Build the sorted index of label ranges."""
+        if self._built:
+            return
+
+        ranges = []
+        for name, val in self._obj.items():
+            start, stop = val.range
+            ranges.append((start, name))
+
+        # Sort by start value
+        ranges.sort(key=lambda x: x[0])
+        self._starts = np.array([r[0] for r in ranges])
+        self._names = [r[1] for r in ranges]
+        self._built = True
+
+    def invalidate(self) -> None:
+        """Invalidate the index (call when items are added/removed)."""
+        self._built = False
+        self._starts = None
+        self._names = None
+
+    def find_single(self, value: int) -> tuple[str, dict] | tuple[None, None]:
+        """Find the name and coordinates for a single label value."""
+        if value == -1:
+            return None, None
+
+        self._build_index()
+        starts = self._starts
+        names = self._names
+        assert starts is not None and names is not None
+
+        # Binary search to find the right range
+        idx = int(np.searchsorted(starts, value, side="right")) - 1
+
+        if idx < 0 or idx >= len(starts):
+            raise ValueError(f"Label {value} is not existent in the model.")
+
+        name = names[idx]
+        val = self._obj[name]
+        start, stop = val.range
+
+        # Verify the value is in range
+        if value < start or value >= stop:
+            raise ValueError(f"Label {value} is not existent in the model.")
+
+        labels = val.labels
+        index = np.unravel_index(value - start, labels.shape)
+        coord = {dim: labels.indexes[dim][i] for dim, i in zip(labels.dims, index)}
+        return name, coord
+
+    def find_single_with_index(
+        self, value: int
+    ) -> tuple[str, dict, tuple[int, ...]] | tuple[None, None, None]:
+        """
+        Find name, coordinates, and raw numpy index for a single label value.
+
+        Returns (name, coord, index) where index is a tuple of integers that
+        can be used for direct numpy indexing (e.g., arr.values[index]).
+        This avoids the overhead of xarray's .sel() method.
+        """
+        if value == -1:
+            return None, None, None
+
+        self._build_index()
+        starts = self._starts
+        names = self._names
+        assert starts is not None and names is not None
+
+        # Binary search to find the right range
+        idx = int(np.searchsorted(starts, value, side="right")) - 1
+
+        if idx < 0 or idx >= len(starts):
+            raise ValueError(f"Label {value} is not existent in the model.")
+
+        name = names[idx]
+        val = self._obj[name]
+        start, stop = val.range
+
+        # Verify the value is in range
+        if value < start or value >= stop:
+            raise ValueError(f"Label {value} is not existent in the model.")
+
+        labels = val.labels
+        index = np.unravel_index(value - start, labels.shape)
+        coord = {dim: labels.indexes[dim][i] for dim, i in zip(labels.dims, index)}
+        return name, coord, index
+
+
+def _get_label_position_linear(
     obj: Any, values: int | np.ndarray
 ) -> (
     tuple[str, dict]
@@ -742,6 +871,9 @@ def get_label_position(
 ):
     """
     Get tuple of name and coordinate for variable labels.
+
+    This is the original O(n) implementation that scans through all items.
+    Used only for testing/benchmarking comparisons.
     """
 
     def find_single(value: int) -> tuple[str, dict] | tuple[None, None]:
@@ -777,6 +909,53 @@ def get_label_position(
         raise ValueError("Array's with more than two dimensions is not supported")
 
 
+def get_label_position(
+    obj: Any,
+    values: int | np.ndarray,
+    index: LabelPositionIndex | None = None,
+) -> (
+    tuple[str, dict]
+    | tuple[None, None]
+    | list[tuple[str, dict] | tuple[None, None]]
+    | list[list[tuple[str, dict] | tuple[None, None]]]
+):
+    """
+    Get tuple of name and coordinate for variable labels.
+
+    Uses O(log n) binary search with a cached index for fast lookups.
+
+    Parameters
+    ----------
+    obj : Any
+        Container object with items() method (Variables or Constraints).
+    values : int or np.ndarray
+        Label value(s) to look up.
+    index : LabelPositionIndex, optional
+        Pre-built index for fast lookups. If None, one will be created.
+
+    Returns
+    -------
+    tuple or list
+        (name, coord) tuple for single values, or list of tuples for arrays.
+    """
+    if index is None:
+        index = LabelPositionIndex(obj)
+
+    if isinstance(values, int):
+        return index.find_single(values)
+
+    values = np.array(values)
+    ndim = values.ndim
+    if ndim == 0:
+        return index.find_single(values.item())
+    elif ndim == 1:
+        return [index.find_single(int(v)) for v in values]
+    elif ndim == 2:
+        return [[index.find_single(int(v)) for v in col] for col in values.T]
+    else:
+        raise ValueError("Array's with more than two dimensions is not supported")
+
+
 def print_coord(coord: dict[str, Any] | Iterable[Any]) -> str:
     """
     Format coordinates into a string representation.
@@ -807,7 +986,7 @@ def print_coord(coord: dict[str, Any] | Iterable[Any]) -> str:
     # Convert each coordinate component to string
     formatted = []
     for value in values:
-        if isinstance(value, (list, tuple)):
+        if isinstance(value, list | tuple):
             formatted.append(f"({', '.join(str(x) for x in value)})")
         else:
             formatted.append(str(value))
@@ -820,14 +999,16 @@ def print_single_variable(model: Any, label: int) -> str:
         return "None"
 
     variables = model.variables
-    name, coord = variables.get_label_position(label)
+    name, coord, index = variables.get_label_position_with_index(label)
 
-    lower = variables[name].lower.sel(coord).item()
-    upper = variables[name].upper.sel(coord).item()
+    var = variables[name]
+    # Use direct numpy indexing instead of .sel() for performance
+    lower = var.lower.values[index]
+    upper = var.upper.values[index]
 
-    if variables[name].attrs["binary"]:
+    if var.attrs["binary"]:
         bounds = " ∈ {0, 1}"
-    elif variables[name].attrs["integer"]:
+    elif var.attrs["integer"]:
         bounds = f" ∈ Z ⋂ [{lower:.4g},...,{upper:.4g}]"
     else:
         bounds = f" ∈ [{lower:.4g}, {upper:.4g}]"
@@ -946,11 +1127,9 @@ def is_constant(func: Callable[..., Any]) -> Callable[..., Any]:
     def wrapper(self: Any, arg: Any) -> Any:
         if isinstance(
             arg,
-            (
-                variables.Variable,
-                variables.ScalarVariable,
-                expressions.LinearExpression,
-            ),
+            variables.Variable
+            | variables.ScalarVariable
+            | expressions.LinearExpression,
         ):
             raise TypeError(f"Assigned rhs must be a constant, got {type(arg)}).")
         return func(self, arg)
@@ -994,13 +1173,13 @@ def check_common_keys_values(list_of_dicts: list[dict[str, Any]]) -> bool:
 
 
 def align(
-    *objects: LinearExpression | Variable | T_Alignable,
+    *objects: LinearExpression | QuadraticExpression | Variable | T_Alignable,
     join: JoinOptions = "inner",
     copy: bool = True,
     indexes: Any = None,
     exclude: str | Iterable[Hashable] = frozenset(),
     fill_value: Any = dtypes.NA,
-) -> tuple[LinearExpression | Variable | T_Alignable, ...]:
+) -> tuple[LinearExpression | QuadraticExpression | Variable | T_Alignable, ...]:
     """
     Given any number of Variables, Expressions, Dataset and/or DataArray objects,
     returns new objects with aligned indexes and dimension sizes.
@@ -1055,13 +1234,13 @@ def align(
 
 
     """
-    from linopy.expressions import LinearExpression
+    from linopy.expressions import LinearExpression, QuadraticExpression
     from linopy.variables import Variable
 
     finisher: list[partial[Any] | Callable[[Any], Any]] = []
     das: list[Any] = []
     for obj in objects:
-        if isinstance(obj, LinearExpression):
+        if isinstance(obj, LinearExpression | QuadraticExpression):
             finisher.append(partial(obj.__class__, model=obj.model))
             das.append(obj.data)
         elif isinstance(obj, Variable):
@@ -1090,7 +1269,14 @@ def align(
     return tuple([f(da) for f, da in zip(finisher, aligned)])
 
 
-LocT = TypeVar("LocT", "Dataset", "Variable", "LinearExpression", "Constraint")
+LocT = TypeVar(
+    "LocT",
+    "Dataset",
+    "Variable",
+    "LinearExpression",
+    "QuadraticExpression",
+    "Constraint",
+)
 
 
 class LocIndexer(Generic[LocT]):

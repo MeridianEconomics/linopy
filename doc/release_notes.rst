@@ -2,13 +2,57 @@ Release Notes
 =============
 
 .. Upcoming Version
-.. ----------------
+
+* Fix compatibility for xpress versions below 9.6 (regression)
+* Performance: Up to 50x faster ``repr()`` for variables/constraints via O(log n) label lookup and direct numpy indexing
+* Performance: Up to 46x faster ``ncons`` property by replacing ``.flat.labels.unique()`` with direct counting
+
+Version 0.5.8
+--------------
+
+* Replace pandas-based LP file writing with polars implementation for significantly improved performance on large models
+* Consolidate "lp" and "lp-polars" io_api options - both now use the optimized polars backend
+* Reduced memory usage and faster file I/O operations when exporting models to LP format
+* Minor bugfix for multiplying variables with numpy type constants
+* Harmonize dtypes before concatenation in lp file writing to avoid dtype mismatch errors. This error occurred when creating and storing models in netcdf format using windows machines and loading and solving them on linux machines.
+* Add option to use polars series as constant input
+* Fix expression merge to explicitly use outer join when combining expressions with disjoint coordinates for consistent behavior across xarray versions
+* Adding xpress postsolve if necessary
+* Handle ImportError in xpress import
+* Fetch and display OETC worker error logs
+* Fix windows permission error when dumping model file
+* Performance improvements for xpress solver using C interface
+
+Version 0.5.7
+--------------
+
+* Removed deprecated future warning for scalar get item operations
+* Silenced version output from the HiGHS solver
+* Mosek: Remove explicit use of Env, use global env instead
+* Objectives can now be created from variables via `linopy.Model.add_objective`
+* Added integration with OETC platform (refactored implementation)
+* Add error message if highspy is not installed
+* Fix MindOpt floating release issue
+* Made merge expressions function infer class without triggering warnings
+* Improved testing coverage
+* Fix pypsa-eur environment path in CI
+
+Version 0.5.6
+--------------
+
+* Improved variable/expression arithmetic methods so that they correctly handle types
+* Gurobi: Pass dictionary as env argument `env={...}` through to gurobi env creation
+
+**Breaking Changes**
+
+* With this release, the package support for Python 3.9 was dropped and support for Python 3.10 was officially added.
+* The selection of a single item in `__getitem__` now returns a `Variable` instead of a `ScalarVariable`.
+
 
 Version 0.5.5
 --------------
 
 * Internally assign new data fields to expressions with a multiindexed-safe routine.
-
 
 Version 0.5.4
 --------------
@@ -17,7 +61,7 @@ Version 0.5.4
 **Bug Fixes**
 
 * Remove default highs log file when `log_fn=None` and `io_api="direct"`. This caused `log_file` in
-`solver_options` to be ignored.
+  `solver_options` to be ignored.
 * Fix the parsing of solutions returned by the CBC solver when setting a MIP duality
   gap tolerance.
 * Improve the mapping of termination conditions for the SCIP solver
@@ -45,8 +89,8 @@ Version 0.5.2
 **Bug Fixes**
 
 * Fix the multiplication with of zero dimensional numpy arrays with linopy objects.
-This is mainly affecting operations where single numerical items from  pandas objects
-are selected and used for multiplication.
+  This is mainly affecting operations where single numerical items from  pandas objects
+  are selected and used for multiplication.
 
 Version 0.5.1
 --------------
@@ -179,7 +223,7 @@ Version 0.3.9
 
 * The constraint assignment with a `LinearExpression` and a constant value when using the pattern `model.add_constraints(lhs_with_constant, sign, rhs)` was fixed. Before, the constant value was not added to the right-hand-side properly which led to the wrong constraint behavior. This is fixed now.
 
-* `nan`s in constants is now handled more consistently. These are ignored when in the addition of expressions (effectively filled by zero). In a future version, this might change to align the propagation of `nan`s with tools like numpy/pandas/xarray.
+* ``nan`` s in constants is now handled more consistently. These are ignored when in the addition of expressions (effectively filled by zero). In a future version, this might change to align the propagation of ``nan`` s with tools like numpy/pandas/xarray.
 
 * Up to now the `rhs` argument in the `add_constraints` function was not supporting an expression as an input type. This is now added.
 

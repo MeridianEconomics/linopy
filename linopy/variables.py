@@ -10,6 +10,7 @@ import functools
 import logging
 from collections.abc import Callable, Hashable, ItemsView, Iterator, Mapping
 from dataclasses import dataclass
+from types import NotImplementedType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -29,6 +30,7 @@ from xarray.core.utils import Frozen
 
 import linopy.expressions as expressions
 from linopy.common import (
+    LabelPositionIndex,
     LocIndexer,
     as_dataarray,
     assign_multiindex_safe,
@@ -51,11 +53,18 @@ from linopy.common import (
 )
 from linopy.config import options
 from linopy.constants import HELPER_DIMS, TERM_DIM
-from linopy.types import ConstantLike, DimsLike, NotImplementedType, SideLike
+from linopy.types import (
+    ConstantLike,
+    DimsLike,
+    ExpressionLike,
+    SideLike,
+    VariableLike,
+)
 
 if TYPE_CHECKING:
     from linopy.constraints import AnonymousScalarConstraint, Constraint
     from linopy.expressions import (
+        GenericExpression,
         LinearExpression,
         LinearExpressionGroupby,
         QuadraticExpression,
@@ -191,22 +200,9 @@ class Variable:
     def __getitem__(
         self, selector: list[int] | int | slice | tuple[int64, str_]
     ) -> Variable | ScalarVariable:
-        keys = selector if isinstance(selector, tuple) else (selector,)
-        if all(map(pd.api.types.is_scalar, keys)):
-            warn(
-                "Accessing a single value with `Variable[...]` and return type "
-                "ScalarVariable is deprecated. In future, this will return a Variable."
-                "To get a ScalarVariable use `Variable.at[...]` instead.",
-                FutureWarning,
-            )
-            return self.at[keys]
-
-        else:
-            # return selected Variable
-            data = Dataset(
-                {k: self.data[k][selector] for k in self.data}, attrs=self.attrs
-            )
-            return self.__class__(data, self.model, self.name)
+        # return selected Variable
+        data = Dataset({k: self.data[k][selector] for k in self.data}, attrs=self.attrs)
+        return self.__class__(data, self.model, self.name)
 
     @property
     def attrs(self) -> dict[str, Hashable]:
@@ -292,12 +288,7 @@ class Variable:
 
     def to_linexpr(
         self,
-        coefficient: int
-        | float
-        | pd.Series
-        | pd.DataFrame
-        | np.ndarray
-        | DataArray = 1,
+        coefficient: ConstantLike = 1,
     ) -> expressions.LinearExpression:
         """
         Create a linear expression from the variables.
@@ -381,19 +372,30 @@ class Variable:
         """
         return self.to_linexpr(-1)
 
-    def __mul__(
-        self, other: float | int | ndarray | Variable
-    ) -> LinearExpression | QuadraticExpression:
+    @overload
+    def __mul__(self, other: ConstantLike) -> LinearExpression: ...
+
+    @overload
+    def __mul__(self, other: ExpressionLike | VariableLike) -> QuadraticExpression: ...
+
+    def __mul__(self, other: SideLike) -> ExpressionLike:
         """
-        Multiply variables with a coefficient.
+        Multiply variables with a coefficient, variable, or expression.
         """
         try:
-            if isinstance(
-                other, (expressions.LinearExpression, Variable, ScalarVariable)
-            ):
+            if isinstance(other, Variable | ScalarVariable):
                 return self.to_linexpr() * other
 
             return self.to_linexpr(other)
+        except TypeError:
+            return NotImplemented
+
+    def __rmul__(self, other: ConstantLike) -> LinearExpression:
+        """
+        Right-multiply variables by a constant
+        """
+        try:
+            return self * other
         except TypeError:
             return NotImplemented
 
@@ -401,23 +403,24 @@ class Variable:
         """
         Power of the variables with a coefficient. The only coefficient allowed is 2.
         """
-        if isinstance(other, int) and other == 2:
+        if not isinstance(other, int):
+            return NotImplemented
+        if other == 2:
             expr = self.to_linexpr()
             return expr._multiply_by_linear_expression(expr)
-        return NotImplemented
+        raise ValueError("Can only raise to the power of 2")
 
-    def __rmul__(self, other: float | DataArray | int | ndarray) -> LinearExpression:
-        """
-        Right-multiply variables with a coefficient.
-        """
-        try:
-            return self.to_linexpr(other)
-        except TypeError:
-            return NotImplemented
+    @overload
+    def __matmul__(self, other: ConstantLike) -> LinearExpression: ...
+
+    @overload
+    def __matmul__(
+        self, other: VariableLike | ExpressionLike
+    ) -> QuadraticExpression: ...
 
     def __matmul__(
-        self, other: LinearExpression | ndarray | Variable
-    ) -> QuadraticExpression | LinearExpression:
+        self, other: ConstantLike | VariableLike | ExpressionLike
+    ) -> LinearExpression | QuadraticExpression:
         """
         Matrix multiplication of variables with a coefficient.
         """
@@ -429,7 +432,7 @@ class Variable:
         """
         Divide variables with a coefficient.
         """
-        if isinstance(other, (expressions.LinearExpression, Variable)):
+        if isinstance(other, expressions.LinearExpression | Variable):
             raise TypeError(
                 "unsupported operand type(s) for /: "
                 f"{type(self)} and {type(other)}. "
@@ -448,9 +451,18 @@ class Variable:
         except TypeError:
             return NotImplemented
 
+    @overload
     def __add__(
-        self, other: int | QuadraticExpression | LinearExpression | Variable
-    ) -> QuadraticExpression | LinearExpression:
+        self, other: ConstantLike | Variable | ScalarLinearExpression
+    ) -> LinearExpression: ...
+
+    @overload
+    def __add__(self, other: GenericExpression) -> GenericExpression: ...
+
+    def __add__(
+        self,
+        other: ConstantLike | Variable | ScalarLinearExpression | GenericExpression,
+    ) -> LinearExpression | GenericExpression:
         """
         Add variables to linear expressions or other variables.
         """
@@ -459,18 +471,38 @@ class Variable:
         except TypeError:
             return NotImplemented
 
-    def __radd__(self, other: int) -> Variable | NotImplementedType:
-        # This is needed for using python's sum function
-        return self if other == 0 else NotImplemented
+    def __radd__(self, other: ConstantLike) -> LinearExpression:
+        try:
+            return self + other
+        except TypeError:
+            return NotImplemented
+
+    @overload
+    def __sub__(
+        self, other: ConstantLike | Variable | ScalarLinearExpression
+    ) -> LinearExpression: ...
+
+    @overload
+    def __sub__(self, other: GenericExpression) -> GenericExpression: ...
 
     def __sub__(
-        self, other: QuadraticExpression | LinearExpression | Variable
-    ) -> QuadraticExpression | LinearExpression:
+        self,
+        other: ConstantLike | Variable | ScalarLinearExpression | GenericExpression,
+    ) -> LinearExpression | GenericExpression:
         """
         Subtract linear expressions or other variables from the variables.
         """
         try:
             return self.to_linexpr() - other
+        except TypeError:
+            return NotImplemented
+
+    def __rsub__(self, other: ConstantLike) -> LinearExpression:
+        """
+        Subtract linear expressions or other variables from the variables.
+        """
+        try:
+            return self.to_linexpr(-1) + other
         except TypeError:
             return NotImplemented
 
@@ -705,18 +737,6 @@ class Variable:
         Return the range of the variable.
         """
         return self.data.attrs["label_range"]
-
-    @classmethod  # type: ignore
-    @property
-    def fill_value(cls) -> dict[str, Any]:
-        """
-        Return the fill value of the variable.
-        """
-        warn(
-            "The `.fill_value` attribute is deprecated, use linopy.variables.FILL_VALUE instead.",
-            DeprecationWarning,
-        )
-        return cls._fill_value
 
     @property
     def mask(self) -> DataArray:
@@ -979,7 +999,7 @@ class Variable:
             _other = other.data
         elif isinstance(other, ScalarVariable):
             _other = {"labels": other.label, "lower": other.lower, "upper": other.upper}
-        elif isinstance(other, (dict, Dataset)):
+        elif isinstance(other, dict | Dataset):
             _other = other
         else:
             raise ValueError(
@@ -1147,6 +1167,7 @@ class Variables:
 
     data: dict[str, Variable]
     model: Model
+    _label_position_index: LabelPositionIndex | None = None
 
     dataset_attrs = ["labels", "lower", "upper"]
     dataset_names = ["Labels", "Lower bounds", "Upper bounds"]
@@ -1237,12 +1258,19 @@ class Variables:
         Add a variable to the variables container.
         """
         self.data[variable.name] = variable
+        self._invalidate_label_position_index()
 
     def remove(self, name: str) -> None:
         """
         Remove variable `name` from the variables.
         """
         self.data.pop(name)
+        self._invalidate_label_position_index()
+
+    def _invalidate_label_position_index(self) -> None:
+        """Invalidate the label position index cache."""
+        if self._label_position_index is not None:
+            self._label_position_index.invalidate()
 
     @property
     def attrs(self) -> dict[Any, Any]:
@@ -1302,7 +1330,14 @@ class Variables:
 
         These excludes variables with missing labels.
         """
-        return len(self.flat.labels.unique())
+        total = 0
+        for var in self.data.values():
+            labels = var.labels.values
+            if var.mask is not None:
+                total += int((labels[var.mask.values] != -1).sum())
+            else:
+                total += int((labels != -1).sum())
+        return total
 
     @property
     def binaries(self) -> Variables:
@@ -1383,7 +1418,7 @@ class Variables:
         name : str
             Name of the containing variable.
         """
-        if not isinstance(label, (float, int, np.integer)) or label < 0:
+        if not isinstance(label, float | int | np.integer) or label < 0:
             raise ValueError("Label must be a positive number.")
         for name, labels in self.labels.items():
             if label in labels:
@@ -1399,8 +1434,36 @@ class Variables:
     def get_label_position(self, values: int | ndarray) -> Any:
         """
         Get tuple of name and coordinate for variable labels.
+
+        Uses an optimized O(log n) binary search implementation with a cached index.
         """
-        return get_label_position(self, values)
+        if self._label_position_index is None:
+            self._label_position_index = LabelPositionIndex(self)
+        return get_label_position(self, values, self._label_position_index)
+
+    def get_label_position_with_index(
+        self, label: int
+    ) -> tuple[str, dict, tuple[int, ...]] | tuple[None, None, None]:
+        """
+        Get name, coordinate, and raw numpy index for a single variable label.
+
+        This is an optimized version that also returns the raw index for direct
+        numpy array access, avoiding xarray's .sel() overhead.
+
+        Parameters
+        ----------
+        label : int
+            The variable label to look up.
+
+        Returns
+        -------
+        tuple
+            (name, coord, index) where index is a tuple for numpy indexing,
+            or (None, None, None) if label is -1.
+        """
+        if self._label_position_index is None:
+            self._label_position_index = LabelPositionIndex(self)
+        return self._label_position_index.find_single_with_index(label)
 
     def print_labels(self, values: list[int]) -> None:
         """
@@ -1467,8 +1530,7 @@ class ScalarVariable:
     """
     A scalar variable container.
 
-    In contrast to the Variable class, a ScalarVariable only contains
-    only one label. Use this class to create a expression or constraint
+    In contrast to the Variable class, a ScalarVariable only contains one label. Use this class to create a expression or constraint
     in a rule.
     """
 
@@ -1516,11 +1578,11 @@ class ScalarVariable:
         return self._model
 
     def to_scalar_linexpr(self, coeff: int | float = 1) -> ScalarLinearExpression:
-        if not isinstance(coeff, (int, np.integer, float)):
+        if not isinstance(coeff, int | np.integer | float):
             raise TypeError(f"Coefficient must be a numeric value, got {type(coeff)}.")
         return expressions.ScalarLinearExpression((coeff,), (self.label,), self.model)
 
-    def to_linexpr(self, coeff: int = 1) -> LinearExpression:
+    def to_linexpr(self, coeff: int | float = 1) -> LinearExpression:
         return self.to_scalar_linexpr(coeff).to_linexpr()
 
     def __neg__(self) -> ScalarLinearExpression:
@@ -1540,6 +1602,8 @@ class ScalarVariable:
         return self.to_scalar_linexpr(coeff)
 
     def __rmul__(self, coeff: int | float) -> ScalarLinearExpression:
+        if isinstance(coeff, Variable | ScalarVariable):
+            return NotImplemented
         return self.to_scalar_linexpr(coeff)
 
     def __div__(self, coeff: int | float) -> ScalarLinearExpression:

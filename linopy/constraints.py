@@ -29,6 +29,7 @@ from xarray.core.utils import Frozen
 
 from linopy import expressions, variables
 from linopy.common import (
+    LabelPositionIndex,
     LocIndexer,
     align_lines_by_delimiter,
     assign_multiindex_safe,
@@ -631,7 +632,7 @@ class Constraint:
         short = filter_nulls_polars(short)
         check_has_nulls_polars(short, name=f"{self.type} {self.name}")
 
-        df = pl.concat([short, long], how="diagonal").sort(["labels", "rhs"])
+        df = pl.concat([short, long], how="diagonal_relaxed").sort(["labels", "rhs"])
         # delete subsequent non-null rhs (happens is all vars per label are -1)
         is_non_null = df["rhs"].is_not_null()
         prev_non_is_null = is_non_null.shift(1).fill_null(False)
@@ -696,6 +697,7 @@ class Constraints:
 
     data: dict[str, Constraint]
     model: Model
+    _label_position_index: LabelPositionIndex | None = None
 
     dataset_attrs = ["labels", "coeffs", "vars", "sign", "rhs"]
     dataset_names = [
@@ -792,12 +794,19 @@ class Constraints:
         Add a constraint to the constraints constrainer.
         """
         self.data[constraint.name] = constraint
+        self._invalidate_label_position_index()
 
     def remove(self, name: str) -> None:
         """
         Remove constraint `name` from the constraints.
         """
         self.data.pop(name)
+        self._invalidate_label_position_index()
+
+    def _invalidate_label_position_index(self) -> None:
+        """Invalidate the label position index cache."""
+        if self._label_position_index is not None:
+            self._label_position_index.invalidate()
 
     @property
     def labels(self) -> Dataset:
@@ -869,9 +878,36 @@ class Constraints:
         """
         Get the number all constraints effectively used by the model.
 
-        These excludes constraints with missing labels.
+        This excludes constraints with missing labels or where all variables
+        are masked (vars == -1).
         """
-        return len(self.flat.labels.unique())
+        total = 0
+        for con in self.data.values():
+            labels = con.labels.values
+            vars_arr = con.vars.values
+
+            # Handle scalar constraint (single constraint, labels is 0-d)
+            if labels.ndim == 0:
+                # Scalar: valid if label != -1 and any var != -1
+                if labels != -1 and (vars_arr != -1).any():
+                    total += 1
+                continue
+
+            # Array constraint: labels has constraint dimensions, vars has
+            # constraint dimensions + _term dimension
+            valid_labels = labels != -1
+
+            # Check if any variable in each constraint is valid (not -1)
+            # vars has shape (..., n_terms) where ... matches labels shape
+            has_valid_var = (vars_arr != -1).any(axis=-1)
+
+            active = valid_labels & has_valid_var
+
+            if con.mask is not None:
+                active = active & con.mask.values
+
+            total += int(active.sum())
+        return total
 
     @property
     def inequalities(self) -> Constraints:
@@ -940,7 +976,7 @@ class Constraints:
         name : str
             Name of the containing constraint.
         """
-        if not isinstance(label, (float, int)) or label < 0:
+        if not isinstance(label, float | int) or label < 0:
             raise ValueError("Label must be a positive number.")
         for name, ds in self.items():
             if label in ds.labels:
@@ -957,8 +993,12 @@ class Constraints:
     ):
         """
         Get tuple of name and coordinate for constraint labels.
+
+        Uses an optimized O(log n) binary search implementation with a cached index.
         """
-        return get_label_position(self, values)
+        if self._label_position_index is None:
+            self._label_position_index = LabelPositionIndex(self)
+        return get_label_position(self, values, self._label_position_index)
 
     def print_labels(
         self, values: Sequence[int], display_max_terms: int | None = None
@@ -1084,7 +1124,7 @@ class AnonymousScalarConstraint:
         """
         Initialize a anonymous scalar constraint.
         """
-        if not isinstance(rhs, (int, float, np.floating, np.integer)):
+        if not isinstance(rhs, int | float | np.floating | np.integer):
             raise TypeError(f"Assigned rhs must be a constant, got {type(rhs)}).")
         self._lhs = lhs
         self._sign = sign

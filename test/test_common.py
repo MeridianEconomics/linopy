@@ -7,6 +7,7 @@ Created on Mon Jun 19 12:11:03 2023
 
 import numpy as np
 import pandas as pd
+import polars as pl
 import pytest
 import xarray as xr
 from test_linear_expression import m, u, x  # noqa: F401
@@ -115,6 +116,16 @@ def test_as_dataarray_with_series_aligned_coords() -> None:
     assert list(da.coords[target_dim].values) == target_index
 
     da = as_dataarray(s, coords={target_dim: target_index})
+    assert isinstance(da, DataArray)
+    assert da.dims == (target_dim,)
+    assert list(da.coords[target_dim].values) == target_index
+
+
+def test_as_dataarray_with_pl_series_dims_default() -> None:
+    target_dim = "dim_0"
+    target_index = [0, 1, 2]
+    s = pl.Series([1, 2, 3])
+    da = as_dataarray(s)
     assert isinstance(da, DataArray)
     assert da.dims == (target_dim,)
     assert list(da.coords[target_dim].values) == target_index
@@ -363,6 +374,14 @@ def test_as_dataarray_with_ndarray_coords_dict_set_dims_not_aligned() -> None:
 
 def test_as_dataarray_with_number() -> None:
     num = 1
+    da = as_dataarray(num, dims=["dim1"], coords=[["a"]])
+    assert isinstance(da, DataArray)
+    assert da.dims == ("dim1",)
+    assert list(da.coords["dim1"].values) == ["a"]
+
+
+def test_as_dataarray_with_np_number() -> None:
+    num = np.float64(1)
     da = as_dataarray(num, dims=["dim1"], coords=[["a"]])
     assert isinstance(da, DataArray)
     assert da.dims == ("dim1",)
